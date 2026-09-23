@@ -314,6 +314,28 @@ sed -i 's|) -> List\[Dict\[str, Any\]\]:|):|; s|) -> Dict\[str, Any\]:|):|; s|) 
 chown -R whatsapp:whatsapp /opt/whatsapp-mcp && systemctl restart whatsapp-mcp
 ```
 
+### Your chats show numbers instead of names
+
+Claude says things like *"147038322880518 says they can come"* instead of naming
+the person. This is WhatsApp's LID migration, and it affects most contacts, not a
+handful. Two scripts fix it, including repairing history already stored:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jwu711/whatsapp-mcp-installer/main/fix-lid-names.sh -o /root/fix-lid-names.sh
+sudo bash /root/fix-lid-names.sh --report
+```
+
+That report changes nothing. Then run it without `--report` to apply the fix.
+
+**[Full explanation in docs/lid-addressing.md](docs/lid-addressing.md)** — why the
+names vanished, why your server had the answer all along, and what the backfill
+can and cannot recover.
+
+### Claude sees WhatsApp in one chat but not a new one
+
+Connectors are per-chat. Check the connector toggle in the new conversation
+before assuming the server is broken.
+
 ### Certificate errors, or the site does not load at all
 
 Almost always DNS or a firewall. Confirm `dig +short yourhostname` returns your
@@ -328,6 +350,11 @@ journalctl -u caddy -n 50 --no-pager
 
 WhatsApp linked-device sessions expire. Check with
 `journalctl -u whatsapp-bridge -n 30`, then run `wa-login` and scan again.
+
+**If it breaks months from now**, suspect a stale version pin before anything
+else. Every failure in this list except the certificate ones traced back to a
+dependency that was fine in early 2025 and had since drifted too far to talk to
+anything. Check whatsmeow and the MCP SDK first.
 
 ---
 
