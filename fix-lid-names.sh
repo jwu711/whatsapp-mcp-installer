@@ -14,7 +14,7 @@
 #      and record PushName for both addresses
 #   3. makes whatsapp.py's get_sender_name consult that table first
 #   4. rebuilds the bridge and restarts the services
-#   5. backfills historical rows from whatever mapping it can find
+#   5. runs backfill-lid.sh to repair history already in the database
 #
 # Usage:
 #   sudo bash fix-lid-names.sh              # patch, rebuild, restart, backfill
@@ -65,8 +65,8 @@ c = sqlite3.connect(f"file:{msg_db}?mode=ro", uri=True)
 try:
     total = c.execute("SELECT count(*) FROM messages").fetchone()[0]
     distinct = c.execute("SELECT count(DISTINCT sender) FROM messages").fetchone()[0]
-    # A LID is a long numeric id; phone numbers are shorter and start with a
-    # country code. This is a heuristic for reporting only.
+    # A LID is a long numeric id; phone numbers are shorter. Heuristic, for
+    # reporting only.
     lidish = c.execute(
         "SELECT count(DISTINCT sender) FROM messages WHERE length(sender) >= 15").fetchone()[0]
     print(f"  messages: {total}, distinct senders: {distinct}, "
@@ -84,8 +84,6 @@ for t in tables(wa_db):
     marker = "  <-- candidate" if "lid" in t.lower() else ""
     print(f"    {t}{marker}")
 
-# Dump the columns of anything that looks like a mapping table, so the backfill
-# can be written against reality rather than a guess.
 c = sqlite3.connect(f"file:{wa_db}?mode=ro", uri=True)
 try:
     for t in tables(wa_db):
@@ -121,7 +119,7 @@ def swap(old, new, why):
     s = s.replace(old, new, 1)
     print(f"  patched: {why}")
 
-# 1. schema: a place to keep display names, keyed by BOTH addresses a person has
+# 1. schema: display names, keyed by BOTH addresses a person has
 swap("""\t\t\tPRIMARY KEY (id, chat_jid),
 \t\t\tFOREIGN KEY (chat_jid) REFERENCES chats(jid)
 \t\t);
@@ -255,78 +253,10 @@ systemctl is-active whatsapp-bridge whatsapp-mcp
 
 # ================================================================= BACKFILL ===
 step "Backfill historical senders"
-sleep 3   # give the bridge a moment to create sender_names
-python3 - "$MSG_DB" "$WA_DB" <<'PY'
-import sqlite3, os, sys
+# Kept in its own script so it can be re-run on its own, and because it backs up
+# messages.db before rewriting any rows.
+curl -fsSL https://raw.githubusercontent.com/jwu711/whatsapp-mcp-installer/main/backfill-lid.sh \\
+  -o /root/backfill-lid.sh && bash /root/backfill-lid.sh
 
-msg_db, wa_db = sys.argv[1], sys.argv[2]
-conn = sqlite3.connect(msg_db)
-cur = conn.cursor()
-
-cur.execute("""CREATE TABLE IF NOT EXISTS sender_names (
-    jid TEXT PRIMARY KEY, push_name TEXT, alt_jid TEXT, updated_at TIMESTAMP)""")
-
-# Source 1: whatsmeow's own LID mapping, if this build keeps one.
-mapped = 0
-if os.path.exists(wa_db):
-    wa = sqlite3.connect(f"file:{wa_db}?mode=ro", uri=True)
-    try:
-        tabs = [r[0] for r in wa.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'")]
-        for t in tabs:
-            if "lid" not in t.lower():
-                continue
-            cols = [r[1] for r in wa.execute(f"PRAGMA table_info('{t}')")]
-            lid_col = next((c for c in cols if "lid" in c.lower()), None)
-            pn_col = next((c for c in cols if c != lid_col and
-                           any(k in c.lower() for k in ("pn", "phone", "jid", "user"))), None)
-            if not (lid_col and pn_col):
-                continue
-            for lid, pn in wa.execute(f"SELECT {lid_col}, {pn_col} FROM '{t}'"):
-                if not lid or not pn:
-                    continue
-                lid_u, pn_u = str(lid).split('@')[0], str(pn).split('@')[0]
-                cur.execute(
-                    "INSERT INTO sender_names (jid, alt_jid) VALUES (?, ?) "
-                    "ON CONFLICT(jid) DO UPDATE SET alt_jid = excluded.alt_jid",
-                    (lid_u, pn_u))
-                mapped += 1
-            print(f"  read {mapped} LID mappings from whatsmeow table '{t}'")
-    finally:
-        wa.close()
-if mapped == 0:
-    print("  no usable LID mapping table found in the whatsmeow store")
-
-# Source 2: rewrite message senders where we now know the phone number.
-cur.execute("""UPDATE messages
-               SET sender = (SELECT alt_jid FROM sender_names
-                             WHERE sender_names.jid = messages.sender
-                               AND alt_jid IS NOT NULL AND alt_jid != '')
-               WHERE EXISTS (SELECT 1 FROM sender_names
-                             WHERE sender_names.jid = messages.sender
-                               AND alt_jid IS NOT NULL AND alt_jid != '')""")
-print(f"  rewrote {cur.rowcount} message rows from LID to phone number")
-
-# Source 3: chats named after a bare id, where we now have a display name.
-cur.execute("""UPDATE chats
-               SET name = (SELECT push_name FROM sender_names
-                           WHERE sender_names.jid = replace(chats.jid, '@lid', '')
-                             AND push_name IS NOT NULL AND push_name != '')
-               WHERE (name IS NULL OR name = replace(chats.jid, '@lid', ''))
-                 AND EXISTS (SELECT 1 FROM sender_names
-                             WHERE sender_names.jid = replace(chats.jid, '@lid', '')
-                               AND push_name IS NOT NULL AND push_name != '')""")
-print(f"  named {cur.rowcount} chats that were showing a bare id")
-
-conn.commit()
-remaining = cur.execute(
-    "SELECT count(DISTINCT sender) FROM messages WHERE length(sender) >= 15").fetchone()[0]
-print(f"  still unresolved: {remaining} distinct senders")
-conn.close()
-PY
-
-chown "$SVC_USER":"$SVC_USER" "$MSG_DB" 2>/dev/null || true
-
-printf '\n\033[1mDone.\033[0m New messages will carry display names.\n'
-printf 'Historical rows are resolved where a mapping existed; the rest fill in\n'
-printf 'as those people send their next message.\n\n'
+printf '\n\033[1mDone.\033[0m New messages carry display names, and history is\n'
+printf 'repaired wherever whatsmeow had a mapping for the sender.\n\n'
