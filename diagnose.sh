@@ -17,6 +17,7 @@ BRIDGE_DIR="$INSTALL_DIR/whatsapp-bridge"
 SERVER_DIR="$INSTALL_DIR/whatsapp-mcp-server"
 MSG_DB="$BRIDGE_DIR/store/messages.db"
 CADDYFILE="${CADDYFILE:-/etc/caddy/Caddyfile}"
+SVC_USER="${SVC_USER:-whatsapp}"
 
 hdr()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 ok()   { printf '   \033[32mOK\033[0m   %s\n' "$*"; }
@@ -121,7 +122,34 @@ if [[ -x "$BRIDGE_DIR/whatsapp-bridge" ]]; then
 else
   bad "bridge binary missing"
 fi
-HOME="$INSTALL_DIR" /usr/local/bin/uv pip list 2>/dev/null | grep -i '^mcp ' | sed 's/^/   mcp python: /' || warn "could not read mcp version"
+# Read the installed version straight from the venv. Do NOT run 'uv' here:
+# running it as root with HOME inside $INSTALL_DIR writes root-owned files into
+# the service user's uv cache, which then stops the MCP server starting at all
+# ("Failed to query Python interpreter ... Permission denied").
+MCPVER=$(ls -d "$SERVER_DIR"/.venv/lib/*/site-packages/mcp-*.dist-info 2>/dev/null \
+         | head -1 | sed -E 's|.*/mcp-([^/]+)\.dist-info|\1|')
+if [[ -n "$MCPVER" ]]; then
+  echo "   mcp python: $MCPVER"
+  case "$MCPVER" in
+    2.*) bad "mcp 2.x installed - it renames FastMCP to MCPServer and main.py will not start"
+         VERDICT+=("mcp $MCPVER is installed. This project needs 1.x. Fix: uv add 'mcp[cli]<2' then restart whatsapp-mcp.") ;;
+  esac
+else
+  warn "could not read mcp version from $SERVER_DIR/.venv"
+fi
+
+hdr "Ownership"
+if [[ -d "$INSTALL_DIR" ]]; then
+  FOREIGN=$(find "$INSTALL_DIR" ! -user "$SVC_USER" 2>/dev/null | head -5)
+  COUNT=$(find "$INSTALL_DIR" ! -user "$SVC_USER" 2>/dev/null | wc -l)
+  if [[ -z "$FOREIGN" ]]; then
+    ok "everything under $INSTALL_DIR is owned by $SVC_USER"
+  else
+    bad "$COUNT path(s) under $INSTALL_DIR are NOT owned by $SVC_USER"
+    echo "$FOREIGN" | sed 's/^/       /'
+    VERDICT+=("$COUNT files under $INSTALL_DIR are not owned by $SVC_USER, so the service cannot write its own cache and the MCP server fails to start. Fix: chown -R $SVC_USER:$SVC_USER $INSTALL_DIR && systemctl restart whatsapp-mcp")
+  fi
+fi
 
 hdr "Caddy config shape (secrets redacted)"
 if [[ -f "$CADDYFILE" ]]; then
@@ -183,6 +211,9 @@ if [[ -n "${WA_HOST:-}" && -n "${SECRET:-}" ]]; then
   if grep -q '"protocolVersion":"2024-11-05"' <<<"$R"; then
     bad "server speaks the 2024 protocol"
     VERDICT+=("The MCP server replied protocolVersion 2024-11-05. claude.ai refuses that. Fix: uv add 'mcp[cli]<2' then restart whatsapp-mcp.")
+  elif grep -q 'MCP server process failed' <<<"$R"; then
+    bad "the Python child process is crashing on spawn"
+    VERDICT+=("supergateway answers but its Python child fails to start. Run the stdio command by hand to see the traceback: cd $SERVER_DIR && sudo -u $SVC_USER HOME=$INSTALL_DIR /usr/local/bin/uv run --directory $SERVER_DIR python main.py")
   elif grep -q '"serverInfo"' <<<"$R"; then
     ok "MCP handshake succeeded"
   else
