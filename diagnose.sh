@@ -153,7 +153,16 @@ fi
 
 hdr "Caddy config shape (secrets redacted)"
 if [[ -f "$CADDYFILE" ]]; then
-  WA_HOST=$(grep -oE '^[a-z0-9][a-z0-9.-]+\.[a-z]+ \{' "$CADDYFILE" 2>/dev/null | head -1 | awk '{print $1}')
+  # Take the host from INSIDE the whatsapp block. Grabbing the first site block
+  # in the file pairs some other vhost's hostname with the WhatsApp secret, and
+  # then every endpoint test below probes the wrong service - which looks exactly
+  # like an auth failure (that other service answers 401) when nothing is wrong.
+  WA_HOST=$(awk '/# --- whatsapp-mcp \(added by/,/# --- end whatsapp-mcp ---/' "$CADDYFILE" 2>/dev/null \
+            | grep -oE '^[a-z0-9][a-z0-9.-]+\.[a-z]+ \{' | head -1 | awk '{print $1}')
+  # Fall back to the first block only if the file carries no marked block.
+  [[ -n "$WA_HOST" ]] || WA_HOST=$(grep -oE '^[a-z0-9][a-z0-9.-]+\.[a-z]+ \{' "$CADDYFILE" 2>/dev/null | head -1 | awk '{print $1}')
+  OTHERS=$(grep -oE '^[A-Za-z0-9:][A-Za-z0-9.:-]* \{' "$CADDYFILE" 2>/dev/null | sed 's/ {//' | grep -vxF "$WA_HOST" | tr '\n' ' ')
+  [[ -n "$OTHERS" ]] && echo "   other vhosts: $OTHERS (not tested here)"
   SECRET=$(sed -n 's|.*/s/\([A-Za-z0-9_-]\{16,\}\)/.*|\1|p' "$CADDYFILE" 2>/dev/null | head -1)
   APIKEY=$(sed -n 's|.*header X-Api-Key "\([^"]*\)".*|\1|p' "$CADDYFILE" 2>/dev/null | head -1)
   echo "   host:        ${WA_HOST:-(none found)}"
@@ -216,6 +225,9 @@ if [[ -n "${WA_HOST:-}" && -n "${SECRET:-}" ]]; then
     VERDICT+=("supergateway answers but its Python child fails to start. Run the stdio command by hand to see the traceback: cd $SERVER_DIR && sudo -u $SVC_USER HOME=$INSTALL_DIR /usr/local/bin/uv run --directory $SERVER_DIR python main.py")
   elif grep -q '"serverInfo"' <<<"$R"; then
     ok "MCP handshake succeeded"
+  elif grep -qi 'unauthorized\|forbidden' <<<"$R"; then
+    bad "endpoint returned an auth error"
+    VERDICT+=("$WA_HOST returned an auth error. If that hostname serves something OTHER than WhatsApp, this test probed the wrong service and the WhatsApp stack may be fine - check the vhost list above.")
   else
     bad "no valid MCP handshake"
     VERDICT+=("The MCP endpoint did not complete a handshake.")
